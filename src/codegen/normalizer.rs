@@ -481,6 +481,20 @@ pub fn schema_supports_complete(schema: &Value) -> bool {
     found
 }
 
+/// Returns `true` when `schema` carries a shorthand `ucp_request` annotation
+/// (`"omit"`, `"optional"`, `"required"`). Shorthand applies to every request
+/// operation, `complete` included, so the complete slice of such a schema
+/// differs from its response shape even though no annotation names `complete`.
+pub fn has_shorthand_request_annotation(schema: &Value) -> bool {
+    let mut found = false;
+    for_each_schema_object(schema, &mut |obj| {
+        if obj.get("ucp_request").is_some_and(Value::is_string) {
+            found = true;
+        }
+    });
+    found
+}
+
 /// Slice a UCP-annotated schema into directional request and response schemas:
 /// `<BaseName>CreateRequest`, `<BaseName>UpdateRequest`, optional `<BaseName>CompleteRequest`
 /// (when `schema_supports_complete(raw_schema)` is `true`), and `<BaseName>` (`Response, "read"`).
@@ -496,7 +510,8 @@ pub fn slice_directional_schemas(
     base_name: &str,
 ) -> Result<Vec<(String, Value)>, ResolveError> {
     let mut out = Vec::new();
-    let supports_complete = schema_supports_complete(raw_schema);
+    let supports_complete =
+        schema_supports_complete(raw_schema) || has_shorthand_request_annotation(raw_schema);
 
     let mut req_ops = vec![("CreateRequest", "create"), ("UpdateRequest", "update")];
     if supports_complete {
@@ -2292,6 +2307,11 @@ mod tests {
             }
         });
         assert!(!has_directional_annotations(&response_only_order));
+
+        // Shorthand applies to every request operation; object form does not.
+        assert!(has_shorthand_request_annotation(&response_only_order));
+        assert!(!has_shorthand_request_annotation(&with_req));
+        assert!(!has_shorthand_request_annotation(&plain));
     }
 
     #[test]

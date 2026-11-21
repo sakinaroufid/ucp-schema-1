@@ -16,7 +16,8 @@ use serde_json::Value;
 use crate::codegen::compose::compose_active_extensions;
 use crate::codegen::hoist::{hoist_defs, insert_sliced_or_normalized_def};
 use crate::codegen::normalizer::{
-    align_directional_refs, flatten_object_allof, qualify_inline_object_titles, to_pascal_case,
+    align_directional_refs, flatten_object_allof, qualify_inline_object_titles,
+    schema_supports_complete, to_pascal_case, update_request_slice_metadata,
 };
 pub use crate::codegen::profile::{parse_profile_source, ParsedProfile, RestServiceBinding};
 use crate::codegen::reachability::{
@@ -259,6 +260,11 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     }
 
     // Stage 6: Directional $ref Alignment & Single-Object/Array allOf Flattening
+    let capability_roots: BTreeSet<String> = active_cap_indices
+        .iter()
+        .map(|&idx| loaded[idx].stem_pascal.clone())
+        .collect();
+    propagate_request_slices(&mut defs, &sliced_base_names, &capability_roots);
     align_all_directional_refs(&mut defs, &sliced_base_names);
     flatten_object_allof(&mut defs);
 
@@ -272,11 +278,19 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
         .iter()
         .flat_map(|&idx| {
             let stem = &loaded[idx].stem_pascal;
-            [
+            // Shorthand annotations give nested types a complete slice; a
+            // capability has one only when an annotation names the operation.
+            let has_complete = root_raw_schemas
+                .get(stem)
+                .is_some_and(schema_supports_complete);
+            let mut names = vec![
                 format!("{stem}CreateRequest"),
                 format!("{stem}UpdateRequest"),
-                format!("{stem}CompleteRequest"),
-            ]
+            ];
+            if has_complete {
+                names.push(format!("{stem}CompleteRequest"));
+            }
+            names
         })
         .collect();
     prune_empty_object_defs(&mut defs, &inlined_mixin_defs, &active_cap_root_requests);
@@ -333,6 +347,71 @@ pub(super) fn directional_request_suffix(name: &str) -> Option<&'static str> {
     ["CreateRequest", "UpdateRequest", "CompleteRequest"]
         .into_iter()
         .find(|s| name.ends_with(s))
+}
+
+/// Give request slices to types that carry no annotations of their own but
+/// refer to a type that has them.
+///
+/// Slicing is decided per type, from its own annotations. A type that only
+/// passes through to an annotated one (`Buyer` -> `Consent` ->
+/// `ConsentPurpose`) is never sliced, so a request slice that reaches it lands
+/// on the response shape of everything behind it: `description` is
+/// `ucp_request: "omit"` on a consent purpose, yet every request type required
+/// it.
+///
+/// For each such carrier and each request suffix, clone the carrier when one
+/// of its refs has a slice for that suffix; ref alignment then points the
+/// clone at it. Repeats until nothing is added, since a carrier can sit behind
+/// another carrier. Clones nothing ends up referencing are pruned in stage 8.
+fn propagate_request_slices(
+    defs: &mut SchemaMap,
+    sliced_base_names: &BTreeSet<String>,
+    capability_roots: &BTreeSet<String>,
+) {
+    const SLICES: [(&str, &str); 3] = [
+        ("CreateRequest", "create"),
+        ("UpdateRequest", "update"),
+        ("CompleteRequest", "complete"),
+    ];
+    loop {
+        let mut added = Vec::new();
+        for (name, val) in defs.iter() {
+            // Sliced types already have the slices their annotations call for,
+            // and a missing one there is deliberate. A capability root has
+            // request slices only for the operations it declares.
+            if sliced_base_names.contains(name)
+                || capability_roots.contains(name)
+                || directional_request_suffix(name).is_some()
+            {
+                continue;
+            }
+            for (suffix, op) in SLICES {
+                let slice_name = format!("{name}{suffix}");
+                if defs.contains_key(&slice_name) {
+                    continue;
+                }
+                let mut reaches_slice = false;
+                for_each_schema_object(val, &mut |obj| {
+                    let target = obj
+                        .get("$ref")
+                        .and_then(Value::as_str)
+                        .and_then(|r| r.strip_prefix("#/$defs/"));
+                    if target.is_some_and(|t| defs.contains_key(&format!("{t}{suffix}"))) {
+                        reaches_slice = true;
+                    }
+                });
+                if reaches_slice {
+                    let mut slice = val.clone();
+                    update_request_slice_metadata(&mut slice, &slice_name, name, op);
+                    added.push((slice_name, slice));
+                }
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        defs.extend(added);
+    }
 }
 
 fn align_all_directional_refs(
@@ -507,6 +586,76 @@ mod tests {
                 "expected {retained} to be retained"
             );
         }
+    }
+
+    // `Buyer` and `Consent` carry no annotations, so slicing skips them. A
+    // request slice that reaches them must still end up on the request slice
+    // of the annotated type behind them, not on its response shape.
+    #[test]
+    fn propagate_request_slices_carries_slices_through_unannotated_types() {
+        let mut defs: SchemaMap = BTreeMap::from([
+            (
+                "CheckoutUpdateRequest".to_string(),
+                json!({ "properties": { "buyer": { "$ref": "#/$defs/Buyer" } } }),
+            ),
+            (
+                "Checkout".to_string(),
+                json!({ "properties": { "buyer": { "$ref": "#/$defs/Buyer" } } }),
+            ),
+            (
+                "Buyer".to_string(),
+                json!({ "properties": { "consent": { "$ref": "#/$defs/Consent" } } }),
+            ),
+            (
+                "Consent".to_string(),
+                json!({ "additionalProperties": { "$ref": "#/$defs/ConsentPurpose" } }),
+            ),
+            (
+                "ConsentPurpose".to_string(),
+                json!({ "required": ["granted", "description"] }),
+            ),
+            (
+                "ConsentPurposeUpdateRequest".to_string(),
+                json!({ "required": ["granted"] }),
+            ),
+            // A capability root gets no slice it did not declare.
+            (
+                "Order".to_string(),
+                json!({ "properties": { "buyer": { "$ref": "#/$defs/Buyer" } } }),
+            ),
+        ]);
+        let sliced = BTreeSet::from(["Checkout".to_string(), "ConsentPurpose".to_string()]);
+        let roots = BTreeSet::from(["Checkout".to_string(), "Order".to_string()]);
+
+        propagate_request_slices(&mut defs, &sliced, &roots);
+        align_all_directional_refs(&mut defs, &sliced);
+
+        assert_eq!(
+            defs["CheckoutUpdateRequest"]["properties"]["buyer"]["$ref"],
+            "#/$defs/BuyerUpdateRequest"
+        );
+        assert_eq!(
+            defs["BuyerUpdateRequest"]["properties"]["consent"]["$ref"],
+            "#/$defs/ConsentUpdateRequest"
+        );
+        assert_eq!(
+            defs["ConsentUpdateRequest"]["additionalProperties"]["$ref"],
+            "#/$defs/ConsentPurposeUpdateRequest"
+        );
+        assert_eq!(defs["BuyerUpdateRequest"]["title"], "BuyerUpdateRequest");
+
+        // The response side is untouched.
+        assert_eq!(
+            defs["Checkout"]["properties"]["buyer"]["$ref"],
+            "#/$defs/Buyer"
+        );
+        assert_eq!(
+            defs["Consent"]["additionalProperties"]["$ref"],
+            "#/$defs/ConsentPurpose"
+        );
+        // Only the suffix that has a slice behind it is propagated.
+        assert!(!defs.contains_key("BuyerCreateRequest"));
+        assert!(!defs.contains_key("OrderUpdateRequest"));
     }
 
     #[test]
